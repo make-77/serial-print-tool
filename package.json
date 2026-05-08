@@ -1,0 +1,19 @@
+{
+  "name": "serial-print-tool",
+  "version": "1.0.0",
+  "description": "Lightweight Web Serial log viewer with regex highlighting, control character visualization, and local auto-save.",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "keywords": [
+    "serial",
+    "web-serial",
+    "log-viewer",
+    "regex-highlighting",
+    "chromium"
+  ],
+  "author": "make-77",
+  "license": "UNLICENSED"
+}

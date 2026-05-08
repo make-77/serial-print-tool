@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f8fafc">
+    <title>串口打印工具</title>
+    <link rel="manifest" href="manifest.webmanifest">
+    <link rel="icon" href="assets/icon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body>
+    <div class="app" data-connected="false">
+      <main class="workspace">
+        <section class="toolbar" aria-label="串口设置">
+          <label class="field field-baud">
+            <span>波特率</span>
+            <input id="baudRate" type="text" inputmode="numeric" value="115200" autocomplete="off">
+          </label>
+
+          <label class="field field-sm">
+            <span>数据位</span>
+            <select id="dataBits">
+              <option>7</option>
+              <option selected>8</option>
+            </select>
+          </label>
+
+          <label class="field field-sm">
+            <span>校验</span>
+            <select id="parity">
+              <option value="none" selected>无</option>
+              <option value="even">偶</option>
+              <option value="odd">奇</option>
+            </select>
+          </label>
+
+          <label class="field field-sm">
+            <span>停止位</span>
+            <select id="stopBits">
+              <option selected>1</option>
+              <option>2</option>
+            </select>
+          </label>
+
+          <label class="field field-mode">
+            <span>显示</span>
+            <select id="displayMode">
+              <option value="ascii" selected>ASCII</option>
+              <option value="hex">HEX</option>
+            </select>
+          </label>
+
+          <label class="field field-regex">
+            <span>标记</span>
+            <input id="markerRegex" placeholder="正则表达式" autocomplete="off" spellcheck="false">
+          </label>
+
+          <button id="connectToggleBtn" class="btn btn-primary" type="button">连接</button>
+
+          <button id="clearBtn" class="btn btn-icon" type="button" title="清空" aria-label="清空">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4h8v2m-9 4 1 10h8l1-10"/></svg>
+            <span>清空</span>
+          </button>
+
+          <label class="check save-check">
+            <input id="autoSave" type="checkbox">
+            <span>自动保存</span>
+          </label>
+
+          <label class="check">
+            <input id="timeStamp" type="checkbox" checked>
+            <span>时间戳</span>
+          </label>
+        </section>
+
+        <section class="terminal-shell" aria-label="日志输出">
+          <div id="terminal" class="terminal" tabindex="0">
+            <div id="lines" class="lines"></div>
+          </div>
+        </section>
+      </main>
+
+      <footer class="statusbar">
+        <div class="status-item status-conn">
+          <span id="statusDot" class="dot"></span>
+          <span id="statusText">未连接</span>
+        </div>
+        <div class="status-item"><span id="statusPort">--</span></div>
+        <div class="status-item"><span id="statusBaud">115200</span></div>
+        <div class="status-item"><span id="statusFormat">8-N-1</span></div>
+        <div class="status-item status-save">保存路径：<span id="savePath">未开启</span></div>
+        <div class="status-item status-runtime">运行时间：<span id="runtime">00:00:00</span></div>
+      </footer>
+    </div>
+
+    <script type="module" src="src/app.js"></script>
+  </body>
+</html>
