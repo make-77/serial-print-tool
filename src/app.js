@@ -1,5 +1,9 @@
-const MAX_LINES = 100000;
+const MAX_LINES = 20000;
 const LINE_HEIGHT = 28;
+const MAX_RENDER_BATCH = 800;
+const MAX_HEX_CARRY_LENGTH = 262144;
+const HEX_CARRY_RETAIN_LENGTH = 65536;
+const MAX_LIVE_LINE_LENGTH = 8192;
 
 const $ = (id) => document.getElementById(id);
 
@@ -11,12 +15,15 @@ const ui = {
   stopBits: $("stopBits"),
   displayMode: $("displayMode"),
   markerRegex: $("markerRegex"),
+  frameRegexField: document.querySelector(".field-frame-regex"),
+  frameRegex: $("frameRegex"),
   connectToggleBtn: $("connectToggleBtn"),
   clearBtn: $("clearBtn"),
   autoSave: $("autoSave"),
   timeStamp: $("timeStamp"),
   terminal: $("terminal"),
   lines: $("lines"),
+  jumpToBottomBtn: $("jumpToBottomBtn"),
   statusText: $("statusText"),
   statusPort: $("statusPort"),
   statusBaud: $("statusBaud"),
@@ -33,12 +40,22 @@ const state = {
   connectedAt: 0,
   carry: "",
   currentLine: null,
+  currentLineDirty: false,
+  currentLineScheduled: false,
   pendingCR: false,
+  hexCarry: "",
   lines: [],
+  renderQueue: [],
+  renderScheduled: false,
+  pendingFollow: false,
   stickToBottom: true,
+  userScrollPaused: false,
+  programmaticScroll: false,
   portLabel: "--",
   markerPattern: "",
   markerRegex: null,
+  framePattern: "",
+  frameRegex: null,
   saveRoot: null,
   saveWritable: null,
   saveQueue: [],
@@ -52,6 +69,8 @@ wireEvents();
 updateFormat();
 updateSaveCapability();
 compileMarker();
+compileFrameRegex();
+updateModeControls();
 showEmpty();
 setInterval(updateMetrics, 500);
 
@@ -64,6 +83,19 @@ function wireEvents() {
     compileMarker();
     rerenderAll();
   });
+  ui.frameRegex.addEventListener("input", () => {
+    compileFrameRegex();
+    if (state.frameRegex) {
+      splitHexCarryIntoFrames();
+    } else {
+      finishHexCarry();
+    }
+  });
+  ui.jumpToBottomBtn.addEventListener("click", () => resumeAutoFollow({ scroll: true }));
+  ui.terminal.addEventListener("wheel", handleTerminalWheel, { passive: true });
+  ui.terminal.addEventListener("touchstart", pauseAutoFollow, { passive: true });
+  ui.terminal.addEventListener("pointerdown", pauseAutoFollow, { passive: true });
+  ui.terminal.addEventListener("keydown", handleTerminalKeydown);
   ui.terminal.addEventListener("scroll", handleTerminalScroll, { passive: true });
 
   for (const el of [ui.dataBits, ui.parity, ui.stopBits, ui.baudRate]) {
@@ -152,11 +184,80 @@ async function readLoop() {
 
 function ingestChunk(bytes) {
   if (ui.displayMode.value === "hex") {
-    addCompleteLine({ time: nowTime(), level: "", message: bytesToHex(bytes) });
+    ingestHexBytes(bytes);
     return;
   }
 
   ingestAsciiText(decoder.decode(bytes, { stream: true }));
+}
+
+function ingestHexBytes(bytes) {
+  const text = bytesToHex(bytes);
+
+  if (!state.frameRegex) {
+    addCompleteLine({ time: nowTime(), level: "", message: text });
+    return;
+  }
+
+  state.hexCarry = state.hexCarry ? `${state.hexCarry} ${text}` : text;
+  splitHexCarryIntoFrames();
+}
+
+function splitHexCarryIntoFrames() {
+  if (!state.hexCarry || !state.frameRegex) return;
+
+  const regex = state.frameRegex;
+  regex.lastIndex = 0;
+
+  let match;
+  let consumed = 0;
+
+  while ((match = regex.exec(state.hexCarry)) !== null) {
+    if (match[0].length === 0) {
+      regex.lastIndex += 1;
+      continue;
+    }
+
+    const prefix = cleanHexSegment(state.hexCarry.slice(consumed, match.index));
+    if (prefix) addCompleteLine({ time: nowTime(), level: "", message: prefix });
+
+    const frame = cleanHexSegment(match[0]);
+    if (frame) addCompleteLine({ time: nowTime(), level: "", message: frame });
+
+    consumed = match.index + match[0].length;
+    if (regex.lastIndex < consumed) regex.lastIndex = consumed;
+  }
+
+  if (consumed > 0) {
+    state.hexCarry = cleanHexSegment(state.hexCarry.slice(consumed));
+    keepBottomIfNeeded();
+  }
+
+  trimHexCarryOverflow();
+}
+
+function finishHexCarry() {
+  const rest = cleanHexSegment(state.hexCarry);
+  state.hexCarry = "";
+
+  if (rest) {
+    addCompleteLine({ time: nowTime(), level: "", message: rest });
+  }
+}
+
+function cleanHexSegment(value) {
+  return value.trim().replace(/\s+/g, " ");
+}
+
+function trimHexCarryOverflow() {
+  if (state.hexCarry.length <= MAX_HEX_CARRY_LENGTH) return;
+
+  const target = state.hexCarry.length - HEX_CARRY_RETAIN_LENGTH;
+  let cutoff = state.hexCarry.indexOf(" ", target);
+  if (cutoff < 0) cutoff = target;
+
+  state.hexCarry = cleanHexSegment(state.hexCarry.slice(cutoff));
+  setStatus("HEX断行缓存过长，已丢弃未匹配数据");
 }
 
 function ingestAsciiText(text) {
@@ -195,9 +296,12 @@ function appendAsciiSegment(segment) {
     return;
   }
 
-  updateDisplayLine(state.currentLine, state.carry);
-  updateLineElement(state.currentLine);
-  keepBottomIfNeeded();
+  state.currentLineDirty = true;
+  scheduleCurrentLineUpdate();
+
+  if (state.carry.length >= MAX_LIVE_LINE_LENGTH) {
+    finishAsciiLine({ force: true });
+  }
 }
 
 function finishAsciiLine(options = {}) {
@@ -211,9 +315,31 @@ function finishAsciiLine(options = {}) {
     updateLineElement(state.currentLine);
   }
 
+  state.currentLineDirty = false;
   queueAutoSave([state.currentLine]);
   state.currentLine = null;
   state.carry = "";
+  keepBottomIfNeeded();
+}
+
+function scheduleCurrentLineUpdate() {
+  if (state.currentLineScheduled) return;
+
+  state.currentLineScheduled = true;
+  requestAnimationFrame(flushCurrentLineUpdate);
+}
+
+function flushCurrentLineUpdate() {
+  state.currentLineScheduled = false;
+  updateCurrentLineIfDirty();
+}
+
+function updateCurrentLineIfDirty() {
+  if (!state.currentLine || !state.currentLineDirty) return;
+
+  updateDisplayLine(state.currentLine, state.carry);
+  state.currentLineDirty = false;
+  updateLineElement(state.currentLine);
   keepBottomIfNeeded();
 }
 
@@ -222,23 +348,61 @@ function addCompleteLine(item) {
 }
 
 function addLine(item, options = {}) {
-  const shouldFollow = state.stickToBottom || isNearBottom();
+  const shouldFollow = shouldAutoFollow();
 
+  item.dropped = false;
   state.lines.push(item);
   if (state.lines.length === 1) ui.lines.textContent = "";
-
-  const el = createLineElement(item);
-  item.el = el;
-  ui.lines.appendChild(el);
+  queueRenderLine(item, shouldFollow);
 
   if (options.save !== false) queueAutoSave([item]);
 
   while (state.lines.length > MAX_LINES) {
     const removed = state.lines.shift();
+    if (removed) removed.dropped = true;
     removed?.el?.remove();
   }
+}
 
-  if (shouldFollow) scrollToBottom();
+function queueRenderLine(item, shouldFollow) {
+  state.renderQueue.push(item);
+  state.pendingFollow = state.pendingFollow || shouldFollow;
+
+  if (!state.renderScheduled) {
+    state.renderScheduled = true;
+    requestAnimationFrame(flushRenderQueue);
+  }
+}
+
+function flushRenderQueue() {
+  state.renderScheduled = false;
+  const fragment = document.createDocumentFragment();
+  let rendered = 0;
+
+  while (state.renderQueue.length && rendered < MAX_RENDER_BATCH) {
+    const item = state.renderQueue.shift();
+    if (!item || item.dropped) continue;
+
+    if (item === state.currentLine) updateCurrentLineIfDirty();
+
+    const el = createLineElement(item);
+    item.el = el;
+    fragment.appendChild(el);
+    rendered += 1;
+  }
+
+  if (rendered) {
+    ui.lines.appendChild(fragment);
+    if (state.pendingFollow && shouldAutoFollow()) scrollToBottom();
+  }
+
+  if (state.renderQueue.length) {
+    state.renderScheduled = true;
+    requestAnimationFrame(flushRenderQueue);
+    return;
+  }
+
+  state.pendingFollow = false;
 }
 
 function makeDisplayLine(text) {
@@ -273,7 +437,15 @@ function normalizeLevel(level) {
 function changeDisplayMode() {
   finishAsciiLine({ force: state.pendingCR });
   state.pendingCR = false;
+  finishHexCarry();
+  updateModeControls();
   setStatus(state.reading ? "已连接" : "未连接");
+}
+
+function updateModeControls() {
+  const isHex = ui.displayMode.value === "hex";
+  ui.frameRegexField.hidden = !isHex;
+  ui.frameRegex.disabled = !isHex;
 }
 
 function compileMarker() {
@@ -295,6 +467,45 @@ function compileMarker() {
     ui.markerRegex.classList.add("invalid");
     setStatus("正则无效");
   }
+}
+
+function compileFrameRegex() {
+  state.framePattern = ui.frameRegex.value.trim();
+  state.frameRegex = null;
+
+  if (!state.framePattern) {
+    ui.frameRegex.title = "";
+    ui.frameRegex.classList.remove("invalid");
+    return;
+  }
+
+  try {
+    state.frameRegex = new RegExp(normalizeFramePattern(state.framePattern), "gi");
+    ui.frameRegex.title = "";
+    ui.frameRegex.classList.remove("invalid");
+  } catch (error) {
+    ui.frameRegex.title = error.message;
+    ui.frameRegex.classList.add("invalid");
+    setStatus("HEX断行正则无效");
+  }
+}
+
+function normalizeFramePattern(pattern) {
+  let value = pattern;
+  if (value.startsWith("^")) value = value.slice(1);
+  if (hasTrailingUnescapedDollar(value)) value = value.slice(0, -1);
+  return value;
+}
+
+function hasTrailingUnescapedDollar(value) {
+  if (!value.endsWith("$")) return false;
+
+  let slashCount = 0;
+  for (let i = value.length - 2; i >= 0 && value[i] === "\\"; i--) {
+    slashCount += 1;
+  }
+
+  return slashCount % 2 === 0;
 }
 
 function createLineElement(item) {
@@ -325,8 +536,10 @@ function updateLineElement(item, existingEl = item.el) {
 }
 
 function rerenderAll() {
-  const shouldFollow = state.stickToBottom || isNearBottom();
+  const shouldFollow = shouldAutoFollow();
   const fragment = document.createDocumentFragment();
+  state.renderQueue.length = 0;
+  state.pendingFollow = false;
 
   if (!state.lines.length) {
     showEmpty();
@@ -441,6 +654,7 @@ async function disconnect() {
   state.reading = false;
   finishAsciiLine({ force: state.pendingCR });
   state.pendingCR = false;
+  finishHexCarry();
 
   try {
     await state.reader?.cancel();
@@ -469,12 +683,19 @@ async function disconnect() {
 }
 
 function clearLog() {
+  for (const item of state.lines) item.dropped = true;
   state.lines.length = 0;
+  state.renderQueue.length = 0;
+  state.pendingFollow = false;
   state.carry = "";
   state.currentLine = null;
+  state.currentLineDirty = false;
   state.pendingCR = false;
+  state.hexCarry = "";
   state.stickToBottom = true;
+  state.userScrollPaused = false;
   ui.terminal.scrollTop = 0;
+  updateJumpButton();
   showEmpty();
 }
 
@@ -685,18 +906,75 @@ function escapeHtml(value) {
 }
 
 function scrollToBottom() {
+  state.programmaticScroll = true;
   ui.terminal.scrollTop = ui.terminal.scrollHeight;
+  requestAnimationFrame(() => {
+    state.programmaticScroll = false;
+    updateJumpButton();
+  });
 }
 
 function keepBottomIfNeeded() {
-  if (state.stickToBottom || isNearBottom()) scrollToBottom();
+  if (shouldAutoFollow()) scrollToBottom();
+}
+
+function shouldAutoFollow() {
+  return state.stickToBottom && !state.userScrollPaused;
+}
+
+function pauseAutoFollow() {
+  if (isNearBottom()) return;
+
+  state.userScrollPaused = true;
+  state.stickToBottom = false;
+  state.pendingFollow = false;
+  updateJumpButton();
+}
+
+function resumeAutoFollow(options = {}) {
+  state.userScrollPaused = false;
+  state.stickToBottom = true;
+  state.pendingFollow = true;
+  updateJumpButton();
+
+  if (options.scroll) scrollToBottom();
+}
+
+function handleTerminalWheel(event) {
+  if (event.deltaY < 0) pauseAutoFollow();
+}
+
+function handleTerminalKeydown(event) {
+  if (event.key === "End") {
+    resumeAutoFollow({ scroll: true });
+    return;
+  }
+
+  if (["ArrowUp", "PageUp", "Home"].includes(event.key)) {
+    pauseAutoFollow();
+  }
 }
 
 function handleTerminalScroll() {
-  state.stickToBottom = isNearBottom();
+  if (isNearBottom()) {
+    resumeAutoFollow({ scroll: false });
+    return;
+  }
+
+  if (!state.programmaticScroll) {
+    state.userScrollPaused = true;
+    state.stickToBottom = false;
+    state.pendingFollow = false;
+  }
+
+  updateJumpButton();
 }
 
 function isNearBottom() {
   const distance = ui.terminal.scrollHeight - ui.terminal.scrollTop - ui.terminal.clientHeight;
-  return distance <= LINE_HEIGHT * 1.5;
+  return distance <= Math.max(LINE_HEIGHT * 4, 180);
+}
+
+function updateJumpButton() {
+  ui.jumpToBottomBtn.hidden = !state.userScrollPaused;
 }

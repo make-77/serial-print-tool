@@ -56,6 +56,11 @@
             <input id="markerRegex" placeholder="正则表达式" autocomplete="off" spellcheck="false">
           </label>
 
+          <label class="field field-frame-regex">
+            <span>HEX断行</span>
+            <input id="frameRegex" placeholder="帧正则表达式" autocomplete="off" spellcheck="false">
+          </label>
+
           <button id="connectToggleBtn" class="btn btn-primary" type="button">连接</button>
 
           <button id="clearBtn" class="btn btn-icon" type="button" title="清空" aria-label="清空">
@@ -78,6 +83,7 @@
           <div id="terminal" class="terminal" tabindex="0">
             <div id="lines" class="lines"></div>
           </div>
+          <button id="jumpToBottomBtn" class="jump-bottom" type="button" hidden>到底部</button>
         </section>
       </main>
 
