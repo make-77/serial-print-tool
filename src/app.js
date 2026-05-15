@@ -1,6 +1,8 @@
 const MAX_LINES = 20000;
+const MAX_VISIBLE_LINES = 3000;
 const LINE_HEIGHT = 28;
-const MAX_RENDER_BATCH = 800;
+const MAX_RENDER_BATCH = 120;
+const MAX_RENDER_TIME_MS = 8;
 const MAX_HEX_CARRY_LENGTH = 262144;
 const HEX_CARRY_RETAIN_LENGTH = 65536;
 const MAX_LIVE_LINE_LENGTH = 8192;
@@ -46,7 +48,12 @@ const state = {
   hexCarry: "",
   lines: [],
   renderQueue: [],
+  renderQueueIndex: 0,
   renderScheduled: false,
+  renderFrameId: 0,
+  currentLineFrameId: 0,
+  scrollFrameId: 0,
+  hiddenRenderDirty: false,
   pendingFollow: false,
   stickToBottom: true,
   userScrollPaused: false,
@@ -108,6 +115,7 @@ function wireEvents() {
   window.addEventListener("beforeunload", () => {
     if (state.saveWritable) state.saveWritable.close().catch(() => {});
   });
+  document.addEventListener("visibilitychange", handleVisibilityChange);
 
   if ("serial" in navigator) {
     navigator.serial.addEventListener("disconnect", (event) => {
@@ -324,12 +332,17 @@ function finishAsciiLine(options = {}) {
 
 function scheduleCurrentLineUpdate() {
   if (state.currentLineScheduled) return;
+  if (document.hidden) {
+    state.hiddenRenderDirty = true;
+    return;
+  }
 
   state.currentLineScheduled = true;
-  requestAnimationFrame(flushCurrentLineUpdate);
+  state.currentLineFrameId = requestAnimationFrame(flushCurrentLineUpdate);
 }
 
 function flushCurrentLineUpdate() {
+  state.currentLineFrameId = 0;
   state.currentLineScheduled = false;
   updateCurrentLineIfDirty();
 }
@@ -341,6 +354,57 @@ function updateCurrentLineIfDirty() {
   state.currentLineDirty = false;
   updateLineElement(state.currentLine);
   keepBottomIfNeeded();
+}
+
+function handleVisibilityChange() {
+  if (document.hidden) {
+    if (state.renderFrameId) cancelAnimationFrame(state.renderFrameId);
+    if (state.currentLineFrameId) cancelAnimationFrame(state.currentLineFrameId);
+    if (state.scrollFrameId) cancelAnimationFrame(state.scrollFrameId);
+
+    state.renderFrameId = 0;
+    state.currentLineFrameId = 0;
+    state.scrollFrameId = 0;
+    state.renderScheduled = false;
+    state.currentLineScheduled = false;
+    state.programmaticScroll = false;
+
+    if (state.renderQueue.length || state.currentLineDirty) {
+      state.hiddenRenderDirty = true;
+    }
+
+    state.renderQueue.length = 0;
+    state.renderQueueIndex = 0;
+    return;
+  }
+
+  if (state.currentLineDirty) updateCurrentLineIfDirty();
+  if (state.hiddenRenderDirty) rebuildVisibleLines();
+}
+
+function visibleLineWindow() {
+  return state.lines.slice(Math.max(0, state.lines.length - MAX_VISIBLE_LINES));
+}
+
+function rebuildVisibleLines() {
+  state.hiddenRenderDirty = false;
+  state.renderQueue.length = 0;
+  state.renderQueueIndex = 0;
+  state.renderScheduled = false;
+
+  if (!state.lines.length) {
+    showEmpty();
+    return;
+  }
+
+  for (const item of visibleLineWindow()) {
+    item.el = null;
+    state.renderQueue.push(item);
+  }
+
+  ui.lines.textContent = "";
+  state.pendingFollow = shouldAutoFollow();
+  scheduleRenderQueue();
 }
 
 function addCompleteLine(item) {
@@ -365,22 +429,38 @@ function addLine(item, options = {}) {
 }
 
 function queueRenderLine(item, shouldFollow) {
+  if (document.hidden) {
+    state.hiddenRenderDirty = true;
+    state.pendingFollow = state.pendingFollow || shouldFollow;
+    return;
+  }
+
   state.renderQueue.push(item);
   state.pendingFollow = state.pendingFollow || shouldFollow;
+  scheduleRenderQueue();
+}
 
-  if (!state.renderScheduled) {
-    state.renderScheduled = true;
-    requestAnimationFrame(flushRenderQueue);
-  }
+function scheduleRenderQueue() {
+  if (state.renderScheduled || document.hidden || !state.renderQueue.length) return;
+
+  state.renderScheduled = true;
+  state.renderFrameId = requestAnimationFrame(flushRenderQueue);
 }
 
 function flushRenderQueue() {
+  state.renderFrameId = 0;
   state.renderScheduled = false;
   const fragment = document.createDocumentFragment();
+  const started = performance.now();
   let rendered = 0;
 
-  while (state.renderQueue.length && rendered < MAX_RENDER_BATCH) {
-    const item = state.renderQueue.shift();
+  while (
+    state.renderQueueIndex < state.renderQueue.length &&
+    rendered < MAX_RENDER_BATCH &&
+    (rendered === 0 || performance.now() - started < MAX_RENDER_TIME_MS)
+  ) {
+    const item = state.renderQueue[state.renderQueueIndex];
+    state.renderQueueIndex += 1;
     if (!item || item.dropped) continue;
 
     if (item === state.currentLine) updateCurrentLineIfDirty();
@@ -393,16 +473,24 @@ function flushRenderQueue() {
 
   if (rendered) {
     ui.lines.appendChild(fragment);
+    trimVisibleDom();
     if (state.pendingFollow && shouldAutoFollow()) scrollToBottom();
   }
 
-  if (state.renderQueue.length) {
-    state.renderScheduled = true;
-    requestAnimationFrame(flushRenderQueue);
+  if (state.renderQueueIndex < state.renderQueue.length) {
+    scheduleRenderQueue();
     return;
   }
 
+  state.renderQueue.length = 0;
+  state.renderQueueIndex = 0;
   state.pendingFollow = false;
+}
+
+function trimVisibleDom() {
+  while (ui.lines.children.length > MAX_VISIBLE_LINES) {
+    ui.lines.firstElementChild?.remove();
+  }
 }
 
 function makeDisplayLine(text) {
@@ -539,14 +627,21 @@ function rerenderAll() {
   const shouldFollow = shouldAutoFollow();
   const fragment = document.createDocumentFragment();
   state.renderQueue.length = 0;
+  state.renderQueueIndex = 0;
   state.pendingFollow = false;
+
+  if (document.hidden) {
+    state.hiddenRenderDirty = true;
+    state.pendingFollow = shouldFollow;
+    return;
+  }
 
   if (!state.lines.length) {
     showEmpty();
     return;
   }
 
-  for (const item of state.lines) {
+  for (const item of visibleLineWindow()) {
     const el = createLineElement(item);
     item.el = el;
     fragment.appendChild(el);
@@ -557,8 +652,7 @@ function rerenderAll() {
 }
 
 function markText(value) {
-  const pieces = visiblePieces(value);
-  if (!state.markerRegex) return renderVisiblePieces(pieces, []);
+  if (!state.markerRegex) return escapeHtml(value);
 
   const regex = state.markerRegex;
   regex.lastIndex = 0;
@@ -574,80 +668,24 @@ function markText(value) {
     if (match[0].length === 0) regex.lastIndex += 1;
   }
 
-  return renderVisiblePieces(pieces, markRanges);
+  return renderMarkedText(value, markRanges);
 }
 
-function visiblePieces(value) {
-  const pieces = [];
-  let rawIndex = 0;
-  let textBuffer = "";
-  let textStart = 0;
-
-  for (const char of value) {
-    const label = controlLabel(char);
-    if (!label) {
-      if (!textBuffer) textStart = rawIndex;
-      textBuffer += char;
-      rawIndex += char.length;
-      continue;
-    }
-
-    pushVisiblePiece(pieces, textBuffer, false, textStart, rawIndex);
-    textBuffer = "";
-    pushVisiblePiece(pieces, label, true, rawIndex, rawIndex + char.length);
-    rawIndex += char.length;
-  }
-
-  pushVisiblePiece(pieces, textBuffer, false, textStart, rawIndex);
-  return pieces;
-}
-
-function pushVisiblePiece(pieces, text, control, rawStart, rawEnd) {
-  if (!text) return;
-
-  pieces.push({
-    text,
-    control,
-    rawStart,
-    rawEnd,
-  });
-}
-
-function renderVisiblePieces(pieces, markRanges) {
-  let rangeIndex = 0;
+function renderMarkedText(value, markRanges) {
+  let cursor = 0;
   let output = "";
 
-  for (const piece of pieces) {
-    let cursor = piece.rawStart;
+  for (const range of markRanges) {
+    const start = Math.max(cursor, range.start);
+    const end = Math.max(start, range.end);
 
-    while (cursor < piece.rawEnd) {
-      while (rangeIndex < markRanges.length && markRanges[rangeIndex].end <= cursor) {
-        rangeIndex += 1;
-      }
-
-      const range = markRanges[rangeIndex];
-      const marked = Boolean(range && range.start <= cursor && range.end > cursor);
-      const nextBoundary = marked ? range.end : (range?.start ?? piece.rawEnd);
-      const next = Math.min(piece.rawEnd, nextBoundary);
-      const text = piece.control
-        ? piece.text
-        : piece.text.slice(cursor - piece.rawStart, next - piece.rawStart);
-
-      output += renderVisibleSegment(text, piece.control, marked);
-      cursor = next;
-    }
+    if (start > cursor) output += escapeHtml(value.slice(cursor, start));
+    if (end > start) output += `<span class="mark">${escapeHtml(value.slice(start, end))}</span>`;
+    cursor = end;
   }
 
+  if (cursor < value.length) output += escapeHtml(value.slice(cursor));
   return output;
-}
-
-function renderVisibleSegment(text, control, marked) {
-  if (!control && !marked) return escapeHtml(text);
-
-  const classes = [];
-  if (control) classes.push("control-char");
-  if (marked) classes.push("mark");
-  return `<span class="${classes.join(" ")}">${escapeHtml(text)}</span>`;
 }
 
 async function disconnect() {
@@ -683,9 +721,20 @@ async function disconnect() {
 }
 
 function clearLog() {
+  if (state.renderFrameId) cancelAnimationFrame(state.renderFrameId);
+  if (state.currentLineFrameId) cancelAnimationFrame(state.currentLineFrameId);
+  if (state.scrollFrameId) cancelAnimationFrame(state.scrollFrameId);
+
   for (const item of state.lines) item.dropped = true;
   state.lines.length = 0;
   state.renderQueue.length = 0;
+  state.renderQueueIndex = 0;
+  state.renderScheduled = false;
+  state.renderFrameId = 0;
+  state.currentLineScheduled = false;
+  state.currentLineFrameId = 0;
+  state.scrollFrameId = 0;
+  state.hiddenRenderDirty = false;
   state.pendingFollow = false;
   state.carry = "";
   state.currentLine = null;
@@ -796,7 +845,7 @@ async function drainAutoSave() {
 function linesToText(lines) {
   return lines.map((item) => {
     const level = item.level ? `${item.level} ` : "";
-    return `[${item.time}] ${level}${visualizeControls(item.message)}`;
+    return `[${item.time}] ${level}${item.message}`;
   }).join("\n") + "\n";
 }
 
@@ -876,21 +925,6 @@ function bytesToHex(bytes) {
   return output;
 }
 
-function visualizeControls(value) {
-  return value.replace(/[\u0000-\u001F\u007F]/g, (char) => controlLabel(char));
-}
-
-function controlLabel(char) {
-  if (char === "\r") return "<CR>";
-  if (char === "\n") return "<LF>";
-  if (char === "\t") return "<TAB>";
-
-  const code = char.charCodeAt(0);
-  if (code > 0x1F && code !== 0x7F) return "";
-  if (code === 0x7F) return "<DEL>";
-  return `<${code.toString(16).toUpperCase().padStart(2, "0")}>`;
-}
-
 function hex(value) {
   return value == null ? "----" : value.toString(16).padStart(4, "0").toUpperCase();
 }
@@ -906,9 +940,15 @@ function escapeHtml(value) {
 }
 
 function scrollToBottom() {
+  if (document.hidden) {
+    state.programmaticScroll = false;
+    return;
+  }
+
   state.programmaticScroll = true;
   ui.terminal.scrollTop = ui.terminal.scrollHeight;
-  requestAnimationFrame(() => {
+  state.scrollFrameId = requestAnimationFrame(() => {
+    state.scrollFrameId = 0;
     state.programmaticScroll = false;
     updateJumpButton();
   });

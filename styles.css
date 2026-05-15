@@ -357,17 +357,6 @@ button:focus-visible,
   color: #101820;
 }
 
-.control-char {
-  border-radius: 3px;
-  color: #ff5a67;
-  font-weight: 700;
-}
-
-.control-char.mark {
-  background: #ffe1e5;
-  color: #d41126;
-}
-
 .empty {
   display: grid;
   place-items: center;
